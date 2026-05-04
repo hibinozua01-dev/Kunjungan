@@ -8,23 +8,30 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // ==================== MIDDLEWARE ====================
+// CORS - Izinkan semua origin untuk sementara (debug)
 app.use(
   cors({
-    origin: [
-      "http://localhost:3000",
-      "http://localhost:8080",
-      "http://localhost:9000",
-      "http://127.0.0.1:9000",
-      "http://localhost:3001",
-      "https://kunjungan-production.up.railway.app",
-      "http://fikri.dasmap.id",
-      "https://fikri.dasmap.id",
-    ],
+    origin: "*", // Izinkan semua origin untuk testing
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "x-visitor-id", "Authorization"],
   }),
 );
+
+// Tambahan header untuk mengatasi CORS
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header(
+    "Access-Control-Allow-Headers",
+    "Origin, X-Requested-With, Content-Type, Accept, x-visitor-id",
+  );
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 app.use(express.json());
 
 // Inisialisasi database SQLite
@@ -103,7 +110,6 @@ db.serialize(() => {
 
 // Mendapatkan tanggal, bulan, tahun sekarang dengan TIMEZONE WIB (UTC+7)
 function getCurrentDateTime() {
-  // Tambah 7 jam untuk WIB (UTC+7)
   const now = new Date();
   const wibTime = new Date(now.getTime() + 7 * 60 * 60 * 1000);
 
@@ -168,7 +174,7 @@ function getClientIp(req) {
   );
 }
 
-// Update semua ringkasan (daily, monthly, yearly)
+// Update semua ringkasan
 async function updateAllSummaries() {
   const { date, month, year } = getCurrentDateTime();
 
@@ -471,11 +477,10 @@ app.get("/api/visit-stats", (req, res) => {
   );
 });
 
-// 3. Mendapatkan history (grafik)
+// 3. Mendapatkan history
 app.get("/api/visit-history", (req, res) => {
   const { period = "daily", limit = 30 } = req.query;
   let query = "";
-  let params = [parseInt(limit)];
 
   switch (period) {
     case "daily":
@@ -491,7 +496,7 @@ app.get("/api/visit-history", (req, res) => {
       query = `SELECT date, pageviews, unique_visitors FROM daily_summary ORDER BY date DESC LIMIT ?`;
   }
 
-  db.all(query, params, (err, rows) => {
+  db.all(query, [parseInt(limit)], (err, rows) => {
     if (err)
       return res.status(500).json({ success: false, error: err.message });
     res.json({ success: true, data: rows });
@@ -544,6 +549,7 @@ app.get("/", (req, res) => {
       "Anti double-count for daily unique visitors (1 per person per day)",
       "Bot filtering",
       "Timezone: Asia/Jakarta (WIB)",
+      "CORS enabled for all origins",
     ],
     endpoints: {
       "POST /api/record-visit":
@@ -561,6 +567,7 @@ app.listen(PORT, () => {
   console.log(`
   🚀 Visit Statistics API running on http://localhost:${PORT}
   🕐 Timezone: Asia/Jakarta (WIB)
+  🔓 CORS: Enabled for all origins
   
   📊 Endpoints ready!
   `);
