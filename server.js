@@ -7,8 +7,24 @@ require("dotenv").config();
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Middleware
-app.use(cors());
+// ==================== MIDDLEWARE ====================
+app.use(
+  cors({
+    origin: [
+      "http://localhost:3000",
+      "http://localhost:8080",
+      "http://localhost:9000",
+      "http://127.0.0.1:9000",
+      "http://localhost:3001",
+      "https://kunjungan-production.up.railway.app",
+      "http://fikri.dasmap.id",
+      "https://fikri.dasmap.id",
+    ],
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "x-visitor-id", "Authorization"],
+  }),
+);
 app.use(express.json());
 
 // Inisialisasi database SQLite
@@ -16,7 +32,6 @@ const db = new sqlite3.Database("./database.sqlite");
 
 // ==================== MEMBUAT TABEL ====================
 db.serialize(() => {
-  // Tabel untuk page views (total kunjungan)
   db.run(`
     CREATE TABLE IF NOT EXISTS page_views (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -29,7 +44,6 @@ db.serialize(() => {
     )
   `);
 
-  // Tabel untuk unique visitors
   db.run(`
     CREATE TABLE IF NOT EXISTS unique_visitors (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,7 +57,6 @@ db.serialize(() => {
     )
   `);
 
-  // Tabel ringkasan harian
   db.run(`
     CREATE TABLE IF NOT EXISTS daily_summary (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,7 +68,6 @@ db.serialize(() => {
     )
   `);
 
-  // Tabel ringkasan bulanan
   db.run(`
     CREATE TABLE IF NOT EXISTS monthly_summary (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,7 +78,6 @@ db.serialize(() => {
     )
   `);
 
-  // Tabel ringkasan tahunan
   db.run(`
     CREATE TABLE IF NOT EXISTS yearly_summary (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,13 +87,12 @@ db.serialize(() => {
     )
   `);
 
-  // Tabel untuk mencatat IP yang sudah direkam (anti spam per hari)
   db.run(`
-    CREATE TABLE IF NOT EXISTS daily_ip_log (
+    CREATE TABLE IF NOT EXISTS daily_visitor_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      ip_address TEXT NOT NULL,
+      visitor_id TEXT NOT NULL,
       visit_date TEXT NOT NULL,
-      UNIQUE(ip_address, visit_date)
+      UNIQUE(visitor_id, visit_date)
     )
   `);
 
@@ -91,14 +101,22 @@ db.serialize(() => {
 
 // ==================== FUNGSI BANTU ====================
 
-// Mendapatkan tanggal, bulan, tahun sekarang
+// Mendapatkan tanggal, bulan, tahun sekarang dengan TIMEZONE WIB (UTC+7)
 function getCurrentDateTime() {
+  // Tambah 7 jam untuk WIB (UTC+7)
   const now = new Date();
+  const wibTime = new Date(now.getTime() + 7 * 60 * 60 * 1000);
+
+  const year = wibTime.getUTCFullYear();
+  const month = String(wibTime.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(wibTime.getUTCDate()).padStart(2, "0");
+  const hour = wibTime.getUTCHours();
+
   return {
-    date: now.toISOString().split("T")[0],
-    hour: now.getHours(),
-    month: now.toISOString().slice(0, 7),
-    year: now.toISOString().slice(0, 4),
+    date: `${year}-${month}-${day}`,
+    hour: hour,
+    month: `${year}-${month}`,
+    year: String(year),
     fullDateTime: now.toISOString(),
   };
 }
@@ -154,21 +172,19 @@ function getClientIp(req) {
 async function updateAllSummaries() {
   const { date, month, year } = getCurrentDateTime();
 
-  // Update daily summary
   db.run(
     `
     INSERT OR REPLACE INTO daily_summary (date, pageviews, unique_visitors, month, year)
     SELECT 
       ?,
       COALESCE((SELECT SUM(count) FROM page_views WHERE visit_date = ?), 0),
-      COALESCE((SELECT COUNT(DISTINCT visitor_id) FROM unique_visitors WHERE date(first_visit) = ?), 0),
+      COALESCE((SELECT COUNT(DISTINCT visitor_id) FROM daily_visitor_log WHERE visit_date = ?), 0),
       ?,
       ?
   `,
-    [date, date, date, month, year]
+    [date, date, date, month, year],
   );
 
-  // Update monthly summary
   db.run(
     `
     INSERT OR REPLACE INTO monthly_summary (month, total_pageviews, total_unique_visitors, year)
@@ -178,10 +194,9 @@ async function updateAllSummaries() {
       COALESCE((SELECT SUM(unique_visitors) FROM daily_summary WHERE month = ?), 0),
       ?
   `,
-    [month, month, month, year]
+    [month, month, month, year],
   );
 
-  // Update yearly summary
   db.run(
     `
     INSERT OR REPLACE INTO yearly_summary (year, total_pageviews, total_unique_visitors)
@@ -190,107 +205,136 @@ async function updateAllSummaries() {
       COALESCE((SELECT SUM(total_pageviews) FROM monthly_summary WHERE year = ?), 0),
       COALESCE((SELECT SUM(total_unique_visitors) FROM monthly_summary WHERE year = ?), 0)
   `,
-    [year, year, year]
+    [year, year, year],
   );
 }
 
 // ==================== API ENDPOINTS ====================
 
-// 1. Mencatat kunjungan baru (LENGKAP dengan filter bot & anti spam)
+// 1. Mencatat kunjungan baru
 app.post("/api/record-visit", (req, res) => {
   const userAgent = req.headers["user-agent"];
   const clientIp = getClientIp(req);
   const { date, hour, month, year } = getCurrentDateTime();
+  const visitorId = req.headers["x-visitor-id"];
 
-  // 1. CEK BOT
+  console.log(
+    `📥 [${new Date().toISOString()}] Request received - Date: ${date}, VisitorID: ${visitorId?.substring(
+      0,
+      8,
+    )}...`,
+  );
+
   if (isBot(userAgent)) {
     console.log(`🤖 Bot detected: ${userAgent}`);
     return res.json({ success: true, message: "Bot ignored", isBot: true });
   }
 
-  // 2. CEK SPAM (Apakah IP ini sudah record hari ini?)
+  if (!visitorId) {
+    console.log("❌ No visitor ID provided");
+    return res.status(400).json({
+      success: false,
+      message: "x-visitor-id header is required. Generate UUID in frontend.",
+    });
+  }
+
   db.get(
-    `SELECT * FROM daily_ip_log WHERE ip_address = ? AND visit_date = ?`,
-    [clientIp, date],
-    (err, row) => {
+    `SELECT * FROM daily_visitor_log WHERE visitor_id = ? AND visit_date = ?`,
+    [visitorId, date],
+    (err, existingRecord) => {
       if (err) {
+        console.error("Database error:", err);
         return res.status(500).json({ success: false, error: err.message });
       }
 
-      const isSpam = !!row;
+      const alreadyRecordedToday = !!existingRecord;
+      console.log(`📊 Already recorded today: ${alreadyRecordedToday}`);
 
-      // 3. UPDATE PAGE VIEWS (tetap dihitung meskipun spam? Tidak, kita hitung hanya sekali per IP per hari)
-      if (!isSpam) {
-        // Catat IP untuk hari ini (anti spam)
-        db.run(
-          `INSERT INTO daily_ip_log (ip_address, visit_date) VALUES (?, ?)`,
-          [clientIp, date]
-        );
-
-        // Update page views per jam
-        db.run(
-          `
+      // SELALU TAMBAH PAGE VIEWS SETIAP REQUEST
+      db.run(
+        `
         INSERT INTO page_views (visit_date, hour, count, month, year)
         VALUES (?, ?, 1, ?, ?)
         ON CONFLICT(visit_date, hour) DO UPDATE SET count = count + 1
       `,
-          [date, hour, month, year]
+        [date, hour, month, year],
+        (err) => {
+          if (err) console.error("Error updating page_views:", err);
+          else console.log(`✅ Page view recorded for ${date} hour ${hour}`);
+        },
+      );
+
+      // CATAT DAILY VISITOR LOG HANYA SEKALI SEHARI
+      if (!alreadyRecordedToday) {
+        db.run(
+          `INSERT INTO daily_visitor_log (visitor_id, visit_date) VALUES (?, ?)`,
+          [visitorId, date],
+          (err) => {
+            if (err) console.error("Error inserting daily visitor log:", err);
+            else
+              console.log(
+                `✅ New daily visitor recorded: ${visitorId.substring(
+                  0,
+                  8,
+                )}...`,
+              );
+          },
         );
       }
 
-      // 4. UNIQUE VISITOR (Dari cookie/local storage visitorId)
-      let visitorId = req.headers["x-visitor-id"];
-
-      if (visitorId) {
-        // Cek apakah visitor sudah ada
-        db.get(
-          `SELECT * FROM unique_visitors WHERE visitor_id = ?`,
-          [visitorId],
-          (err, existingVisitor) => {
-            if (err) {
-              return res
-                .status(500)
-                .json({ success: false, error: err.message });
-            }
-
-            if (existingVisitor) {
-              // Update existing visitor
-              db.run(
-                `
-            UPDATE unique_visitors 
-            SET last_visit = ?, visit_count = visit_count + 1, user_agent = ?, ip_address = ?
-            WHERE visitor_id = ?
-          `,
-                [date, userAgent, clientIp, visitorId]
-              );
-            } else {
-              // Insert new unique visitor
-              db.run(
-                `
-            INSERT INTO unique_visitors (visitor_id, first_visit, last_visit, visit_count, user_agent, ip_address)
-            VALUES (?, ?, ?, 1, ?, ?)
-          `,
-                [visitorId, date, date, userAgent, clientIp]
-              );
-            }
+      // UNIQUE VISITOR MANAGEMENT
+      db.get(
+        `SELECT * FROM unique_visitors WHERE visitor_id = ?`,
+        [visitorId],
+        (err, existingVisitor) => {
+          if (err) {
+            console.error("Error checking unique_visitors:", err);
+          } else if (existingVisitor) {
+            db.run(
+              `UPDATE unique_visitors SET last_visit = ?, visit_count = visit_count + 1, user_agent = ?, ip_address = ? WHERE visitor_id = ?`,
+              [date, userAgent, clientIp, visitorId],
+              (err) => {
+                if (err) console.error("Error updating unique_visitors:", err);
+                else
+                  console.log(
+                    `✅ Updated existing visitor, count: ${
+                      existingVisitor.visit_count + 1
+                    }`,
+                  );
+              },
+            );
+          } else {
+            db.run(
+              `INSERT INTO unique_visitors (visitor_id, first_visit, last_visit, visit_count, user_agent, ip_address) VALUES (?, ?, ?, 1, ?, ?)`,
+              [visitorId, date, date, userAgent, clientIp],
+              (err) => {
+                if (err) console.error("Error inserting unique_visitors:", err);
+                else console.log(`✅ New unique visitor created`);
+              },
+            );
           }
-        );
-      }
+        },
+      );
 
-      // 5. UPDATE SEMUA RINGKASAN
       updateAllSummaries();
 
-      // 6. AMBIL STAT TERBARU
-      getCurrentStats((stats) => {
-        res.json({
-          success: true,
-          message: isSpam ? "Already recorded today" : "Visit recorded",
-          isSpam: isSpam,
-          isBot: false,
-          data: stats,
+      setTimeout(() => {
+        getCurrentStats((stats) => {
+          console.log(
+            `📊 Current stats - Daily pageviews: ${stats.daily_pageviews}, Unique: ${stats.daily_unique}`,
+          );
+          res.json({
+            success: true,
+            message: alreadyRecordedToday
+              ? "Already recorded today (but page view still counted)"
+              : "Visit recorded successfully",
+            alreadyRecordedToday: alreadyRecordedToday,
+            isBot: false,
+            data: stats,
+          });
         });
-      });
-    }
+      }, 100);
+    },
   );
 });
 
@@ -323,13 +367,13 @@ function getCurrentStats(callback) {
                     month: month,
                     year: year,
                   });
-                }
+                },
               );
-            }
+            },
           );
-        }
+        },
       );
-    }
+    },
   );
 }
 
@@ -337,23 +381,18 @@ function getCurrentStats(callback) {
 app.get("/api/visit-stats", (req, res) => {
   const { date, month, year } = getCurrentDateTime();
 
-  // Ambil kunjungan hari ini (pageviews)
   db.get(
     `SELECT pageviews FROM daily_summary WHERE date = ?`,
     [date],
     (err, dailyPageviews) => {
       if (err)
         return res.status(500).json({ success: false, error: err.message });
-
-      // Ambil unique visitors hari ini
       db.get(
         `SELECT unique_visitors FROM daily_summary WHERE date = ?`,
         [date],
         (err, dailyUnique) => {
           if (err)
             return res.status(500).json({ success: false, error: err.message });
-
-          // Ambil pageviews bulan ini
           db.get(
             `SELECT total_pageviews as pageviews FROM monthly_summary WHERE month = ?`,
             [month],
@@ -362,8 +401,6 @@ app.get("/api/visit-stats", (req, res) => {
                 return res
                   .status(500)
                   .json({ success: false, error: err.message });
-
-              // Ambil unique visitors bulan ini
               db.get(
                 `SELECT total_unique_visitors as unique_visitors FROM monthly_summary WHERE month = ?`,
                 [month],
@@ -372,8 +409,6 @@ app.get("/api/visit-stats", (req, res) => {
                     return res
                       .status(500)
                       .json({ success: false, error: err.message });
-
-                  // Ambil pageviews tahun ini
                   db.get(
                     `SELECT total_pageviews as pageviews FROM yearly_summary WHERE year = ?`,
                     [year],
@@ -382,8 +417,6 @@ app.get("/api/visit-stats", (req, res) => {
                         return res
                           .status(500)
                           .json({ success: false, error: err.message });
-
-                      // Ambil unique visitors tahun ini
                       db.get(
                         `SELECT total_unique_visitors as unique_visitors FROM yearly_summary WHERE year = ?`,
                         [year],
@@ -392,7 +425,6 @@ app.get("/api/visit-stats", (req, res) => {
                             return res
                               .status(500)
                               .json({ success: false, error: err.message });
-
                           res.json({
                             success: true,
                             data: {
@@ -425,65 +457,43 @@ app.get("/api/visit-stats", (req, res) => {
                               current_year: year,
                             },
                           });
-                        }
+                        },
                       );
-                    }
+                    },
                   );
-                }
+                },
               );
-            }
+            },
           );
-        }
+        },
       );
-    }
+    },
   );
 });
 
 // 3. Mendapatkan history (grafik)
 app.get("/api/visit-history", (req, res) => {
   const { period = "daily", limit = 30 } = req.query;
-
   let query = "";
   let params = [parseInt(limit)];
 
   switch (period) {
     case "daily":
-      query = `
-        SELECT date, pageviews, unique_visitors 
-        FROM daily_summary 
-        ORDER BY date DESC 
-        LIMIT ?
-      `;
+      query = `SELECT date, pageviews, unique_visitors FROM daily_summary ORDER BY date DESC LIMIT ?`;
       break;
     case "monthly":
-      query = `
-        SELECT month as period, total_pageviews as pageviews, total_unique_visitors as unique_visitors 
-        FROM monthly_summary 
-        ORDER BY month DESC 
-        LIMIT ?
-      `;
+      query = `SELECT month as period, total_pageviews as pageviews, total_unique_visitors as unique_visitors FROM monthly_summary ORDER BY month DESC LIMIT ?`;
       break;
     case "yearly":
-      query = `
-        SELECT year as period, total_pageviews as pageviews, total_unique_visitors as unique_visitors 
-        FROM yearly_summary 
-        ORDER BY year DESC 
-        LIMIT ?
-      `;
+      query = `SELECT year as period, total_pageviews as pageviews, total_unique_visitors as unique_visitors FROM yearly_summary ORDER BY year DESC LIMIT ?`;
       break;
     default:
-      query = `
-        SELECT date, pageviews, unique_visitors 
-        FROM daily_summary 
-        ORDER BY date DESC 
-        LIMIT ?
-      `;
+      query = `SELECT date, pageviews, unique_visitors FROM daily_summary ORDER BY date DESC LIMIT ?`;
   }
 
   db.all(query, params, (err, rows) => {
-    if (err) {
+    if (err)
       return res.status(500).json({ success: false, error: err.message });
-    }
     res.json({ success: true, data: rows });
   });
 });
@@ -491,25 +501,18 @@ app.get("/api/visit-history", (req, res) => {
 // 4. Mendapatkan top visitors
 app.get("/api/top-visitors", (req, res) => {
   const { limit = 10 } = req.query;
-
   db.all(
-    `
-    SELECT visitor_id, visit_count, first_visit, last_visit 
-    FROM unique_visitors 
-    ORDER BY visit_count DESC 
-    LIMIT ?
-  `,
+    `SELECT visitor_id, visit_count, first_visit, last_visit FROM unique_visitors ORDER BY visit_count DESC LIMIT ?`,
     [parseInt(limit)],
     (err, rows) => {
-      if (err) {
+      if (err)
         return res.status(500).json({ success: false, error: err.message });
-      }
       res.json({ success: true, data: rows });
-    }
+    },
   );
 });
 
-// 5. Reset data (dengan secret key)
+// 5. Reset data
 app.delete("/api/reset-stats", (req, res) => {
   const secretKey = req.headers["x-secret-key"];
   const validKey = process.env.SECRET_KEY || "your-secret-key-here";
@@ -524,8 +527,7 @@ app.delete("/api/reset-stats", (req, res) => {
     db.run(`DELETE FROM daily_summary`);
     db.run(`DELETE FROM monthly_summary`);
     db.run(`DELETE FROM yearly_summary`);
-    db.run(`DELETE FROM daily_ip_log`);
-
+    db.run(`DELETE FROM daily_visitor_log`);
     res.json({ success: true, message: "All statistics reset successfully" });
   });
 });
@@ -534,21 +536,21 @@ app.delete("/api/reset-stats", (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     name: "Visit Statistics API",
-    version: "2.0.0",
+    version: "3.1.0",
     features: [
       "Real-time page views tracking",
-      "Unique visitors tracking",
-      "Anti-spam (1 record per IP per day)",
+      "Unique visitors tracking per person (based on UUID)",
+      "Page views increase on EVERY refresh",
+      "Anti double-count for daily unique visitors (1 per person per day)",
       "Bot filtering",
-      "Hourly, daily, monthly, yearly statistics",
+      "Timezone: Asia/Jakarta (WIB)",
     ],
     endpoints: {
       "POST /api/record-visit":
         "Record a new visit (requires x-visitor-id header)",
       "GET /api/visit-stats": "Get current statistics",
-      "GET /api/visit-history?period=daily&limit=30":
-        "Get visit history for charts",
-      "GET /api/top-visitors?limit=10": "Get top visitors by visit count",
+      "GET /api/visit-history": "Get visit history for charts",
+      "GET /api/top-visitors": "Get top visitors by visit count",
       "DELETE /api/reset-stats": "Reset all data (requires secret key)",
     },
   });
@@ -558,18 +560,8 @@ app.get("/", (req, res) => {
 app.listen(PORT, () => {
   console.log(`
   🚀 Visit Statistics API running on http://localhost:${PORT}
+  🕐 Timezone: Asia/Jakarta (WIB)
   
-  📊 Endpoints:
-  ┌─────────────────────────────────────────────────────────┐
-  │  POST  /api/record-visit    - Record new visit         │
-  │  GET   /api/visit-stats     - Get current statistics   │
-  │  GET   /api/visit-history   - Get history for charts   │
-  │  GET   /api/top-visitors    - Get top visitors         │
-  └─────────────────────────────────────────────────────────┘
-  
-  💡 Tips:
-  - Kirim header 'x-visitor-id' dengan UUID unik dari frontend
-  - Bot akan otomatis diabaikan
-  - 1 IP hanya bisa record 1x per hari
+  📊 Endpoints ready!
   `);
 });
