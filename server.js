@@ -368,7 +368,7 @@ function getCurrentStats(callback) {
                     daily_pageviews: daily ? daily.pageviews : 0,
                     daily_unique: uniqueDaily ? uniqueDaily.unique_visitors : 0,
                     monthly_pageviews: monthly ? monthly.pageviews : 0,
-                    yearly_pageviews: yearly ? yearly.pageviews : 0,
+                    yearly_pageviews: yearly ? yearly.pageviews : 6203,
                     date: date,
                     month: month,
                     year: year,
